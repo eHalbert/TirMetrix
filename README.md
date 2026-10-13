@@ -1,4 +1,4 @@
-<img src="docs/capture-principale.png" alt="Fenêtre principale de TirMetrix" width="800">
+<img src="docs/TirMetrix.png" alt="Fenêtre principale de TirMetrix" width="800">
 
 # TirMetrix
 
