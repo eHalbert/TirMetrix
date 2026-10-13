@@ -1,3 +1,5 @@
+![Fenêtre principale de TirMetrix](docs/TirMetrix.png)
+
 # TirMetrix
 
 **Analyse de cible ISSF C50 pour le tir à 25 m.**
