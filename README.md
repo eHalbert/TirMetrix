@@ -6,7 +6,7 @@ TirMetrix est une application de bureau (Python / Tkinter) qui permet d'analyser
 
 > ⚠️ TirMetrix est un outil d'entraînement personnel. Ses résultats n'ont **aucune valeur officielle** : le score et les mesures dépendent de la qualité de la photo, de la calibration et du placement manuel des impacts.
 
-<img src="docs/TirMetrix.png" alt="Fenêtre principale de TirMetrix" width="800">
+<img src="TirMetrix.png" alt="Fenêtre principale de TirMetrix" width="800">
 
 ## Fonctionnalités
 
