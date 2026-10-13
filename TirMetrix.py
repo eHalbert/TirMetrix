@@ -7,14 +7,12 @@ Usage:
 
 Dependencies:
     pip install opencv-python numpy Pillow
-    
-License
-    Copyright (c) 2026 Édouard HALBERT — CC BY-NC 4.0
 """
 
 import sys
 import os
 import math
+import bisect
 import json
 import glob
 from datetime import datetime
@@ -936,6 +934,171 @@ def bullet_rpm(velocity_m_s: float, twist_in_per_turn: float) -> float:
     return turns_per_second * 60.0
 
 
+# ---------------------------------------------------------------------------
+# Exterior ballistics: point-mass trajectory with G1 drag
+# ---------------------------------------------------------------------------
+
+# Standard G1 drag function: (Mach, Cd), linearly interpolated.
+G1_DRAG_TABLE: list[tuple[float, float]] = [
+    (0.00, 0.2629), (0.05, 0.2558), (0.10, 0.2487), (0.15, 0.2413), (0.20, 0.2344),
+    (0.25, 0.2278), (0.30, 0.2214), (0.35, 0.2155), (0.40, 0.2104), (0.45, 0.2061),
+    (0.50, 0.2032), (0.55, 0.2020), (0.60, 0.2034), (0.70, 0.2165), (0.725, 0.2230),
+    (0.75, 0.2313), (0.775, 0.2417), (0.80, 0.2546), (0.825, 0.2706), (0.85, 0.2901),
+    (0.875, 0.3136), (0.90, 0.3415), (0.925, 0.3734), (0.95, 0.4084), (0.975, 0.4448),
+    (1.00, 0.4805), (1.025, 0.5136), (1.05, 0.5427), (1.075, 0.5677), (1.10, 0.5883),
+    (1.125, 0.6053), (1.15, 0.6191), (1.20, 0.6393), (1.25, 0.6518), (1.30, 0.6589),
+    (1.35, 0.6621), (1.40, 0.6625), (1.45, 0.6607), (1.50, 0.6573), (1.55, 0.6528),
+    (1.60, 0.6474), (1.65, 0.6413), (1.70, 0.6347), (1.75, 0.6280), (1.80, 0.6210),
+    (1.85, 0.6141), (1.90, 0.6072), (1.95, 0.6003), (2.00, 0.5934), (2.05, 0.5867),
+    (2.10, 0.5804), (2.15, 0.5743), (2.20, 0.5685), (2.25, 0.5630), (2.30, 0.5577),
+    (2.35, 0.5527), (2.40, 0.5481), (2.45, 0.5438), (2.50, 0.5397), (2.60, 0.5325),
+    (2.70, 0.5264), (2.80, 0.5211), (2.90, 0.5168), (3.00, 0.5133), (3.10, 0.5105),
+    (3.20, 0.5084), (3.30, 0.5067), (3.40, 0.5054), (3.50, 0.5040), (3.60, 0.5030),
+    (3.70, 0.5022), (3.80, 0.5016), (3.90, 0.5010), (4.00, 0.5006), (4.20, 0.4998),
+    (4.40, 0.4995), (4.60, 0.4992), (4.80, 0.4990), (5.00, 0.4988),
+]  # fmt: skip
+_G1_MACH = np.array([m for m, _ in G1_DRAG_TABLE])
+_G1_CD = np.array([cd for _, cd in G1_DRAG_TABLE])
+
+GRAIN_KG = 6.479891e-5  # 1 grain in kg
+GRAVITY = 9.80665  # m/s²
+SD_G1_REF = 703.0696  # 1 lb/in² in kg/m²: sectional density of the G1 reference projectile
+R_AIR = 287.05  # specific gas constant of dry air, J/(kg·K)
+
+
+def g1_cd(mach: float) -> float:
+    """G1 drag coefficient at the given Mach number."""
+    return float(np.interp(mach, _G1_MACH, _G1_CD))
+
+
+def _ballistic_deriv(s: tuple, bc_g1: float, wind_z: float, rho: float, c_sound: float) -> tuple:
+    """Time derivative of the state (x, y, z, vx, vy, vz).
+    x = downrange, y = up, z = to the right; the crosswind blows along +z."""
+    _x, _y, _z, vx, vy, vz = s
+    rx, ry, rz = vx, vy, vz - wind_z  # velocity relative to the air
+    v_rel = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if v_rel == 0.0:
+        return (vx, vy, vz, 0.0, -GRAVITY, 0.0)
+    cd = g1_cd(v_rel / c_sound)
+    # Deceleration of the G1 reference projectile (m/d² = 1 lb/in²), divided by the BC.
+    k = 0.5 * rho * cd * math.pi / (4.0 * SD_G1_REF) / bc_g1 * v_rel
+    return (vx, vy, vz, -k * rx, -k * ry - GRAVITY, -k * rz)
+
+
+def integrate_trajectory(
+    v0: float, bc_g1: float, angle_rad: float, x_max: float, wind_z: float, rho: float, c_sound: float, dt: float = 0.0005
+) -> np.ndarray:
+    """RK4 integration from the muzzle up to x >= x_max (or until the bullet is too slow).
+    Returns rows (t, x, y, z, speed), with y measured from the bore axis at the muzzle."""
+    s = (0.0, 0.0, 0.0, v0 * math.cos(angle_rad), v0 * math.sin(angle_rad), 0.0)
+    t = 0.0
+    rows = [(t, 0.0, 0.0, 0.0, v0)]
+    args = (bc_g1, wind_z, rho, c_sound)
+    while s[0] < x_max and s[3] > 20.0 and t < 60.0:
+        k1 = _ballistic_deriv(s, *args)
+        k2 = _ballistic_deriv(tuple(a + 0.5 * dt * b for a, b in zip(s, k1)), *args)
+        k3 = _ballistic_deriv(tuple(a + 0.5 * dt * b for a, b in zip(s, k2)), *args)
+        k4 = _ballistic_deriv(tuple(a + dt * b for a, b in zip(s, k3)), *args)
+        s = tuple(a + dt / 6.0 * (b + 2.0 * c + 2.0 * d + e) for a, b, c, d, e in zip(s, k1, k2, k3, k4))
+        t += dt
+        rows.append((t, s[0], s[1], s[2], math.sqrt(s[3] ** 2 + s[4] ** 2 + s[5] ** 2)))
+    return np.array(rows)
+
+
+def compute_trajectory_table(
+    mass_grains: float,
+    bc_g1: float,
+    muzzle_velocity_m_s: float,
+    sight_height_mm: float,
+    zero_distance_m: float,
+    max_distance_m: float,
+    step_m: float,
+    temperature_c: float = 15.0,
+    pressure_hpa: float = 1013.25,
+    crosswind_m_s: float = 0.0,
+) -> dict:
+    """Point-mass trajectory zeroed at `zero_distance_m` (no wind), then flown
+    with the given crosswind. The line of sight is horizontal, `sight_height_mm`
+    above the bore axis. Raises ValueError on non-physical input."""
+    if min(mass_grains, bc_g1, muzzle_velocity_m_s, zero_distance_m, max_distance_m, step_m, pressure_hpa) <= 0 or sight_height_mm < 0:
+        raise ValueError("Toutes les valeurs doivent être strictement positives (hauteur de visée ≥ 0).")
+    if step_m > max_distance_m:
+        raise ValueError("Le pas doit être inférieur ou égal à la distance maximale.")
+    if max_distance_m / step_m > 400:
+        raise ValueError("Trop de lignes : augmentez le pas ou réduisez la distance maximale.")
+    temp_k = temperature_c + 273.15
+    if temp_k <= 0:
+        raise ValueError("Température invalide.")
+
+    rho = pressure_hpa * 100.0 / (R_AIR * temp_k)  # dry-air density
+    c_sound = math.sqrt(1.4 * R_AIR * temp_k)
+    h = sight_height_mm / 1000.0
+    mass_kg = mass_grains * GRAIN_KG
+
+    def y_at(angle: float, x_target: float) -> float:
+        tr = integrate_trajectory(muzzle_velocity_m_s, bc_g1, angle, x_target, 0.0, rho, c_sound)
+        if tr[-1, 1] < x_target:
+            raise ValueError("La balle n'atteint pas la distance demandée (vitesse trop faible).")
+        return float(np.interp(x_target, tr[:, 1], tr[:, 2]))
+
+    # Find the bore elevation for which the bullet crosses the line of sight at the zero distance.
+    lo, hi = -0.05, 0.30
+    if y_at(hi, zero_distance_m) < h or y_at(lo, zero_distance_m) > h:
+        raise ValueError("Distance de réglage inatteignable avec ces paramètres.")
+    for _ in range(50):
+        mid = 0.5 * (lo + hi)
+        if y_at(mid, zero_distance_m) < h:
+            lo = mid
+        else:
+            hi = mid
+    angle = 0.5 * (lo + hi)
+
+    traj = integrate_trajectory(muzzle_velocity_m_s, bc_g1, angle, max_distance_m, crosswind_m_s, rho, c_sound)
+    if traj[-1, 1] < max_distance_m:
+        raise ValueError("La balle n'atteint pas la distance maximale (vitesse trop faible).")
+
+    n_rows = int(math.floor(max_distance_m / step_m + 1e-9))
+    dists = np.arange(1, n_rows + 1) * step_m
+    rows = []
+    for d in dists:
+        rows.append(
+            {
+                "distance_m": float(d),
+                "drop_mm": (float(np.interp(d, traj[:, 1], traj[:, 2])) - h) * 1000.0,  # relative to line of sight
+                "velocity_m_s": float(np.interp(d, traj[:, 1], traj[:, 4])),
+                "energy_j": 0.5 * mass_kg * float(np.interp(d, traj[:, 1], traj[:, 4])) ** 2,
+                "time_ms": float(np.interp(d, traj[:, 1], traj[:, 0])) * 1000.0,
+                "drift_mm": float(np.interp(d, traj[:, 1], traj[:, 3])) * 1000.0,
+            }
+        )
+
+    # Near zero: first crossing of the line of sight (bullet rising through it).
+    rel_y = traj[:, 2] - h
+    above = np.where(rel_y >= 0.0)[0]
+    near_zero_m = None
+    if len(above) and above[0] > 0:
+        i = above[0]
+        y0, y1 = rel_y[i - 1], rel_y[i]
+        near_zero_m = float(traj[i - 1, 1] + (traj[i, 1] - traj[i - 1, 1]) * (-y0) / (y1 - y0))
+
+    plot_x = np.linspace(0.0, max_distance_m, 200)
+    plot_drop = (np.interp(plot_x, traj[:, 1], traj[:, 2]) - h) * 1000.0
+    return {
+        "angle_mrad": angle * 1000.0,
+        "angle_deg": math.degrees(angle),
+        "near_zero_m": near_zero_m,
+        "max_rise_mm": float(np.max(rel_y)) * 1000.0,
+        "muzzle_energy_j": 0.5 * mass_kg * muzzle_velocity_m_s**2,
+        "air_density": rho,
+        "speed_of_sound": c_sound,
+        "rows": rows,
+        "plot_x_m": plot_x,
+        "plot_drop_mm": plot_drop,
+        "zero_m": zero_distance_m,
+        "step_m": step_m,
+    }
+
+
 class StabilityWindow(tk.Toplevel):
     """
     Gyroscopic stability (SG, Miller formula) calculator: input fields for
@@ -949,7 +1112,7 @@ class StabilityWindow(tk.Toplevel):
         "diameter_mm": "8.9",
         "length_mm": "15.0",
         "twist_in": "9.7",
-        "velocity_m_s": "360.0",
+        "velocity_m_s": "350.0",
         "temperature_c": "15.0",
         "pressure_hpa": "1013.25",
     }
@@ -1134,6 +1297,695 @@ class StabilityWindow(tk.Toplevel):
             self._regime_var.set(f"Entrée invalide : {exc}")
             self._regime_lbl.configure(fg="#ff5555")
             self._detail_var.set("")
+
+
+# ---------------------------------------------------------------------------
+# External ballistics (point-mass trajectory, G1 drag model)
+# ---------------------------------------------------------------------------
+
+# Standard G1 drag function: (Mach number, drag coefficient Cd).
+G1_DRAG_TABLE: list[tuple[float, float]] = [
+    (0.00, 0.2629), (0.05, 0.2558), (0.10, 0.2487), (0.15, 0.2413), (0.20, 0.2344),
+    (0.25, 0.2278), (0.30, 0.2214), (0.35, 0.2155), (0.40, 0.2104), (0.45, 0.2061),
+    (0.50, 0.2032), (0.55, 0.2020), (0.60, 0.2034), (0.70, 0.2165), (0.725, 0.2230),
+    (0.75, 0.2313), (0.775, 0.2417), (0.80, 0.2546), (0.825, 0.2706), (0.85, 0.2901),
+    (0.875, 0.3136), (0.90, 0.3415), (0.925, 0.3734), (0.95, 0.4084), (0.975, 0.4448),
+    (1.00, 0.4805), (1.025, 0.5136), (1.05, 0.5427), (1.075, 0.5677), (1.10, 0.5883),
+    (1.125, 0.6053), (1.15, 0.6191), (1.20, 0.6393), (1.25, 0.6518), (1.30, 0.6589),
+    (1.35, 0.6621), (1.40, 0.6625), (1.45, 0.6607), (1.50, 0.6573), (1.55, 0.6528),
+    (1.60, 0.6474), (1.65, 0.6413), (1.70, 0.6347), (1.75, 0.6280), (1.80, 0.6210),
+    (1.85, 0.6141), (1.90, 0.6072), (1.95, 0.6003), (2.00, 0.5934), (2.05, 0.5867),
+    (2.10, 0.5804), (2.15, 0.5743), (2.20, 0.5685), (2.25, 0.5630), (2.30, 0.5577),
+    (2.35, 0.5527), (2.40, 0.5481), (2.45, 0.5438), (2.50, 0.5397), (2.60, 0.5325),
+    (2.70, 0.5264), (2.80, 0.5211), (2.90, 0.5168), (3.00, 0.5133), (3.10, 0.5105),
+    (3.20, 0.5084), (3.30, 0.5067), (3.40, 0.5054), (3.50, 0.5040), (3.60, 0.5030),
+    (3.70, 0.5022), (3.80, 0.5016), (3.90, 0.5010), (4.00, 0.5006), (4.20, 0.4998),
+    (4.40, 0.4995), (4.60, 0.4992), (4.80, 0.4990), (5.00, 0.4988),
+]
+_G1_MACHS = [m for m, _ in G1_DRAG_TABLE]
+_LB_PER_IN2_TO_KG_PER_M2 = 703.0696  # unit of the ballistic coefficient (lb/in²)
+_GRAIN_TO_KG = 6.479891e-5
+
+
+def g1_drag_coefficient(mach: float) -> float:
+    """Linear interpolation of the G1 drag coefficient at the given Mach number."""
+    if mach <= _G1_MACHS[0]:
+        return G1_DRAG_TABLE[0][1]
+    if mach >= _G1_MACHS[-1]:
+        return G1_DRAG_TABLE[-1][1]
+    i = bisect.bisect_right(_G1_MACHS, mach)
+    m0, c0 = G1_DRAG_TABLE[i - 1]
+    m1, c1 = G1_DRAG_TABLE[i]
+    return c0 + (c1 - c0) * (mach - m0) / (m1 - m0)
+
+
+def ballistic_trajectory(
+    mass_grains: float,
+    bc_g1: float,
+    velocity_m_s: float,
+    sight_height_mm: float,
+    zero_m: float,
+    max_m: float,
+    step_m: float,
+    temperature_c: float = 15.0,
+    pressure_hpa: float = 1013.25,
+    crosswind_m_s: float = 0.0,
+) -> dict:
+    """Point-mass trajectory with G1 drag, zeroed at `zero_m`.
+
+    The bullet is launched from the bore axis; the sights are `sight_height_mm`
+    above it and the line of sight is taken as horizontal. The launch angle is
+    solved so the trajectory crosses the line of sight at `zero_m`.
+    Air is treated as dry (no humidity correction). A crosswind (positive =
+    blowing from the right) produces a drift with the classic "lag time" rule.
+
+    Returns {"rows": [...], "angle_rad", "sound_speed", "mach1_m"} where each row
+    holds distance, drop relative to the line of sight, speed, energy, flight
+    time and wind drift. Raises ValueError on non-physical input.
+    """
+    if min(mass_grains, bc_g1, velocity_m_s, zero_m, max_m, step_m, pressure_hpa) <= 0 or sight_height_mm < 0:
+        raise ValueError("Les valeurs physiques doivent être strictement positives.")
+    if temperature_c <= -273.15:
+        raise ValueError("Température invalide.")
+    if max_m > 3000 or max_m / step_m > 2000:
+        raise ValueError("Distance max ≤ 3000 m et au plus 2000 lignes (augmentez le pas).")
+
+    temp_k = temperature_c + 273.15
+    rho = pressure_hpa * 100.0 / (287.05 * temp_k)  # dry air density, kg/m³
+    c = math.sqrt(1.4 * 287.05 * temp_k)  # speed of sound, m/s
+    mass_kg = mass_grains * _GRAIN_TO_KG
+    # Drag deceleration = rho·v²·Cd·pi / (8·BC), BC converted to kg/m².
+    drag_k = rho * math.pi / (8.0 * bc_g1 * _LB_PER_IN2_TO_KG_PER_M2)
+    g = 9.80665
+    h = sight_height_mm / 1000.0
+    dt = 0.0005
+
+    def acc(vx: float, vy: float) -> tuple[float, float]:
+        v = math.hypot(vx, vy)
+        k = drag_k * g1_drag_coefficient(v / c) * v
+        return -k * vx, -k * vy - g
+
+    def fly(theta: float, targets: list[float]):
+        """Integrate (RK4) until the last target distance; return, for each
+        target, (height above bore, speed, time), plus where Mach 1 is crossed."""
+        x = y = t = 0.0
+        vx = velocity_m_s * math.cos(theta)
+        vy = velocity_m_s * math.sin(theta)
+        out: list[tuple[float, float, float]] = []
+        mach1_x = 0.0 if velocity_m_s <= c else None
+        idx = 0
+        while idx < len(targets):
+            if math.hypot(vx, vy) < 20.0 or t > 60.0:
+                raise ValueError("La balle n'atteint pas la distance demandée.")
+            ax1, ay1 = acc(vx, vy)
+            vx2, vy2 = vx + 0.5 * dt * ax1, vy + 0.5 * dt * ay1
+            ax2, ay2 = acc(vx2, vy2)
+            vx3, vy3 = vx + 0.5 * dt * ax2, vy + 0.5 * dt * ay2
+            ax3, ay3 = acc(vx3, vy3)
+            vx4, vy4 = vx + dt * ax3, vy + dt * ay3
+            ax4, ay4 = acc(vx4, vy4)
+            nx = x + dt / 6.0 * (vx + 2 * vx2 + 2 * vx3 + vx4)
+            ny = y + dt / 6.0 * (vy + 2 * vy2 + 2 * vy3 + vy4)
+            nvx = vx + dt / 6.0 * (ax1 + 2 * ax2 + 2 * ax3 + ax4)
+            nvy = vy + dt / 6.0 * (ay1 + 2 * ay2 + 2 * ay3 + ay4)
+            nt = t + dt
+            while idx < len(targets) and nx >= targets[idx]:
+                f = (targets[idx] - x) / (nx - x)
+                out.append((y + f * (ny - y), math.hypot(vx + f * (nvx - vx), vy + f * (nvy - vy)), t + f * dt))
+                idx += 1
+            if mach1_x is None and math.hypot(nvx, nvy) <= c:
+                mach1_x = nx
+            x, y, vx, vy, t = nx, ny, nvx, nvy, nt
+        return out, mach1_x
+
+    # Solve the launch angle so the bullet crosses the line of sight at zero_m.
+    def miss(theta: float) -> float:
+        return fly(theta, [zero_m])[0][0][0] - h
+
+    lo, hi = 0.0, 0.35
+    if miss(hi) < 0.0:
+        raise ValueError("Distance de réglage inatteignable avec ces paramètres.")
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if miss(mid) < 0.0:
+            lo = mid
+        else:
+            hi = mid
+    theta = 0.5 * (lo + hi)
+
+    n_rows = int(max_m / step_m + 1e-9)
+    if n_rows < 1:
+        raise ValueError("La distance max doit être supérieure ou égale au pas.")
+    distances = [step_m * (i + 1) for i in range(n_rows)]
+    samples, mach1_x = fly(theta, distances)
+
+    rows = []
+    for d, (y, v, t) in zip(distances, samples):
+        drop = y - h
+        rows.append(
+            {
+                "distance_m": d,
+                "drop_cm": drop * 100.0,
+                "drop_mrad": drop / d * 1000.0,
+                "velocity_m_s": v,
+                "energy_j": 0.5 * mass_kg * v * v,
+                "time_ms": t * 1000.0,
+                # + = to the right; a wind from the right pushes the bullet left.
+                "drift_cm": -crosswind_m_s * (t - d / velocity_m_s) * 100.0,
+            }
+        )
+    return {"rows": rows, "angle_rad": theta, "sound_speed": c, "mach1_m": mach1_x}
+
+
+class BallisticsWindow(tk.Toplevel):
+    """
+    Trajectory calculator: bullet / sights / atmosphere parameters on the
+    left; summary, distance table and drop chart on the right.
+    """
+
+    _DEFAULTS = {
+        "mass_grains": "124.0",
+        "bc_g1": "0.152",
+        "velocity_m_s": "350.0",
+        "sight_height_mm": "10.0",
+        "zero_m": "25.0",
+        "max_m": "50.0",
+        "step_m": "5.0",
+        "temperature_c": "15.0",
+        "pressure_hpa": "1013.25",
+        "wind_m_s": "0.0",
+    }
+
+    def __init__(self, master: "TargetApp"):
+        super().__init__(master)
+        self.title("Balistique — trajectoire de la balle")
+        self.configure(bg="#0f0f14")
+        self.minsize(900, 560)
+        self._center_on_parent(master, width=1100, height=700)
+
+        self._entries: dict[str, tk.Entry] = {}
+        self._result: dict | None = None
+        self._sight_height_mm = 0.0
+        self._build_ui()
+        self._calculate()  # show a result immediately, using the defaults
+
+    def _center_on_parent(self, master: tk.Tk, width: int, height: int):
+        master.update_idletasks()
+        px, py = master.winfo_rootx(), master.winfo_rooty()
+        pw, ph = master.winfo_width(), master.winfo_height()
+        x = px + max(0, (pw - width) // 2)
+        y = py + max(0, (ph - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    # -- UI ------------------------------------------------------------
+
+    def _build_ui(self):
+        left = tk.Frame(self, bg="#12121c", padx=14, pady=12, width=330)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        left.pack_propagate(False)
+
+        tk.Label(left, text="PARAMÈTRES", bg="#12121c", fg="#55ff55", font=("Consolas", 9, "bold"), anchor="w").pack(fill=tk.X, pady=(0, 8))
+
+        fields = [
+            ("mass_grains", "Masse (grains)"),
+            ("bc_g1", "Coef. balistique G1"),
+            ("velocity_m_s", "Vitesse initiale (m/s)"),
+            ("sight_height_mm", "Hauteur de visée (mm)"),
+            ("zero_m", "Distance de réglage (m)"),
+            ("max_m", "Distance max (m)"),
+            ("step_m", "Pas (m)"),
+            ("temperature_c", "Température (°C)"),
+            ("pressure_hpa", "Pression (hPa)"),
+            ("wind_m_s", "Vent de travers (m/s)"),
+        ]
+        for key, label in fields:
+            row = tk.Frame(left, bg="#12121c")
+            row.pack(fill=tk.X, pady=3)
+            entry = tk.Entry(
+                row, bg="#1e1e30", fg="#e0e0f0", insertbackground="#e0e0f0", relief=tk.FLAT, font=("Consolas", 9), justify="right", width=8
+            )
+            entry.insert(0, self._DEFAULTS[key])
+            entry.pack(side=tk.RIGHT)
+            tk.Label(row, text=label, bg="#12121c", fg="#ffffff", font=("Consolas", 9), anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+            entry.bind("<Return>", lambda _e: self._calculate())
+            self._entries[key] = entry
+
+        tk.Button(
+            left,
+            text="Calculer",
+            command=self._calculate,
+            bg="#3a6fd8",
+            fg="#ffffff",
+            relief=tk.FLAT,
+            font=("Consolas", 9, "bold"),
+            padx=10,
+            pady=6,
+            cursor="hand2",
+            activebackground="#50508a",
+            activeforeground="#ffffff",
+        ).pack(fill=tk.X, pady=(10, 0))
+
+        tk.Label(
+            left,
+            text=(
+                "Coef. G1 : valeur indiquée par le fabricant de la munition.\n"
+                "Hauteur de visée : distance entre l'axe du canon et la ligne de mire.\n"
+                "Vent : positif = vent venant de la droite ; dérive positive = vers la droite.\n"
+                "Modèle : point matériel, traînée G1, air sec. Valeurs indicatives."
+            ),
+            bg="#12121c",
+            fg="#666680",
+            font=("Consolas", 8),
+            justify="left",
+            anchor="w",
+            wraplength=300,
+        ).pack(fill=tk.X, pady=(12, 0))
+
+        right = tk.Frame(self, bg="#0f0f14", padx=10, pady=10)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        tk.Label(right, text="RÉSULTAT", bg="#0f0f14", fg="#55ff55", font=("Consolas", 9, "bold"), anchor="w").pack(fill=tk.X)
+        self._summary_var = tk.StringVar(value="—")
+        self._summary_lbl = tk.Label(
+            right, textvariable=self._summary_var, bg="#0f0f14", fg="#ffffff", font=("Consolas", 9), justify="left", anchor="w", wraplength=700
+        )
+        self._summary_lbl.pack(fill=tk.X, pady=(2, 8))
+
+        style = ttk.Style(self)
+        style.configure("Ballistic.Treeview", background="#12121c", fieldbackground="#12121c", foreground="#e0e0f0", rowheight=22)
+        style.configure("Ballistic.Treeview.Heading", font=("Consolas", 9, "bold"))
+
+        cols = ("dist", "drop", "mrad", "vel", "energy", "time", "drift")
+        heads = [
+            ("dist", "Dist. (m)", 70),
+            ("drop", "Chute/LdV (cm)", 110),
+            ("mrad", "Chute (mrad)", 95),
+            ("vel", "Vitesse (m/s)", 95),
+            ("energy", "Énergie (J)", 90),
+            ("time", "Temps (ms)", 90),
+            ("drift", "Dérive (cm)", 90),
+        ]
+        self._tree = ttk.Treeview(right, columns=cols, show="headings", height=9, style="Ballistic.Treeview")
+        for col, label, width in heads:
+            self._tree.heading(col, text=label)
+            self._tree.column(col, width=width, anchor="center")
+        self._tree.pack(fill=tk.X)
+
+        self._canvas = tk.Canvas(right, bg="#0a0a10", highlightthickness=0, height=240)
+        self._canvas.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self._canvas.bind("<Configure>", lambda _e: self._draw_chart())
+
+    # -- Logic -----------------------------------------------------------
+
+    def _value(self, key: str) -> float:
+        return float(self._entries[key].get().replace(",", "."))
+
+    def _calculate(self):
+        try:
+            res = ballistic_trajectory(
+                mass_grains=self._value("mass_grains"),
+                bc_g1=self._value("bc_g1"),
+                velocity_m_s=self._value("velocity_m_s"),
+                sight_height_mm=self._value("sight_height_mm"),
+                zero_m=self._value("zero_m"),
+                max_m=self._value("max_m"),
+                step_m=self._value("step_m"),
+                temperature_c=self._value("temperature_c"),
+                pressure_hpa=self._value("pressure_hpa"),
+                crosswind_m_s=self._value("wind_m_s"),
+            )
+        except (ValueError, ZeroDivisionError) as exc:
+            self._result = None
+            self._summary_var.set(f"Entrée invalide : {exc}")
+            self._summary_lbl.configure(fg="#ff5555")
+            for item in self._tree.get_children():
+                self._tree.delete(item)
+            self._draw_chart()
+            return
+
+        self._result = res
+        self._sight_height_mm = self._value("sight_height_mm")
+
+        mach1 = res["mach1_m"]
+        if mach1 is None:
+            regime = "Reste supersonique sur toute la distance calculée."
+        elif mach1 <= 0.0:
+            regime = "Subsonique dès la bouche du canon."
+        else:
+            regime = f"Passe sous Mach 1 à environ {mach1:.0f} m."
+        self._summary_var.set(
+            f"Angle de départ : {res['angle_rad'] * 1000:.2f} mrad  |  Vitesse du son : {res['sound_speed']:.0f} m/s\n"
+            f"{regime}  Réglage à {self._value('zero_m'):g} m."
+        )
+        self._summary_lbl.configure(fg="#ffffff")
+
+        for item in self._tree.get_children():
+            self._tree.delete(item)
+        for r in res["rows"]:
+            self._tree.insert(
+                "",
+                "end",
+                values=(
+                    f"{r['distance_m']:g}",
+                    f"{r['drop_cm']:+.1f}",
+                    f"{r['drop_mrad']:+.2f}",
+                    f"{r['velocity_m_s']:.0f}",
+                    f"{r['energy_j']:.0f}",
+                    f"{r['time_ms']:.0f}",
+                    f"{r['drift_cm']:+.1f}",
+                ),
+            )
+        self._draw_chart()
+
+    def _draw_chart(self):
+        """Plot the height of the trajectory relative to the line of sight."""
+        c = self._canvas
+        c.delete("all")
+        if not self._result:
+            return
+
+        pts = [(0.0, -self._sight_height_mm / 10.0)] + [(r["distance_m"], r["drop_cm"]) for r in self._result["rows"]]
+        w = max(c.winfo_width(), 300)
+        h = max(c.winfo_height(), 150)
+        ml, mr, mt, mb = 60, 20, 28, 34
+
+        x_max = pts[-1][0] or 1.0
+        y_min = min(0.0, min(p[1] for p in pts))
+        y_max = max(0.0, max(p[1] for p in pts))
+        if y_max - y_min < 1e-6:
+            y_max = y_min + 1.0
+        pad = (y_max - y_min) * 0.1
+        y_min -= pad
+        y_max += pad
+
+        def x_of(x):
+            return ml + (w - ml - mr) * x / x_max
+
+        def y_of(y):
+            return mt + (h - mt - mb) * (1 - (y - y_min) / (y_max - y_min))
+
+        for g in range(5):
+            gv = y_min + (y_max - y_min) * g / 4
+            gy = y_of(gv)
+            c.create_line(ml, gy, w - mr, gy, fill="#222235")
+            c.create_text(ml - 6, gy, anchor="e", fill="#888899", font=("Consolas", 8), text=f"{gv:.1f}")
+        for g in range(6):
+            gx = x_max * g / 5
+            c.create_text(x_of(gx), h - mb + 12, fill="#888899", font=("Consolas", 8), text=f"{gx:g}")
+
+        # Line of sight (zero height) and the trajectory itself.
+        c.create_line(ml, y_of(0.0), w - mr, y_of(0.0), fill="#55ff55", dash=(4, 3))
+        flat = []
+        for x, y in pts:
+            flat.extend([x_of(x), y_of(y)])
+        c.create_line(*flat, fill="#00cfff", width=2)
+        for x, y in pts[1:]:
+            c.create_oval(x_of(x) - 3, y_of(y) - 3, x_of(x) + 3, y_of(y) + 3, fill="#00cfff", outline="#ffffff")
+
+        c.create_text(ml, 8, anchor="nw", fill="#ffffff", font=("Consolas", 9, "bold"), text="Hauteur par rapport à la ligne de mire (cm)")
+        c.create_text(w - mr, h - 6, anchor="se", fill="#888899", font=("Consolas", 8), text="distance (m)")
+        c.create_text(w - mr, 8, anchor="ne", fill="#55ff55", font=("Consolas", 8), text="- - ligne de mire")
+
+
+class BallisticsWindow(tk.Toplevel):
+    """
+    Exterior ballistics calculator: bullet / sight / atmosphere parameters on
+    the left, trajectory table and a drop-vs-distance chart on the right.
+    """
+
+    # Indicative values only: replace with the manufacturer's data or a chronograph reading.
+    _PRESETS = {
+        "9 mm Parabellum — 124 gr FMJ": {"mass_grains": "124.0", "bc": "0.152", "velocity_m_s": "350.0"},
+        ".22 LR — 40 gr plomb": {"mass_grains": "40.0", "bc": "0.130", "velocity_m_s": "330.0"},
+        ".45 ACP — 230 gr FMJ": {"mass_grains": "230.0", "bc": "0.150", "velocity_m_s": "250.0"},
+    }
+    _DEFAULTS = {
+        "mass_grains": "124.0",
+        "bc": "0.152",
+        "velocity_m_s": "350.0",
+        "sight_height_mm": "10.0",
+        "zero_m": "25",
+        "max_m": "50",
+        "step_m": "5",
+        "temperature_c": "15.0",
+        "pressure_hpa": "1013.25",
+        "wind_m_s": "0.0",
+    }
+
+    def __init__(self, master: "TargetApp"):
+        super().__init__(master)
+        self.title("Balistique — trajectoire de la balle")
+        self.configure(bg="#0f0f14")
+        self.minsize(900, 620)
+        self._center_on_parent(master, width=1150, height=760)
+
+        self._entries: dict[str, tk.Entry] = {}
+        self._result: dict | None = None
+        self._preset_var = tk.StringVar(value=next(iter(self._PRESETS)))
+        self._build_ui()
+        self._calculate()
+
+    def _center_on_parent(self, master: tk.Tk, width: int, height: int):
+        master.update_idletasks()
+        px, py = master.winfo_rootx(), master.winfo_rooty()
+        pw, ph = master.winfo_width(), master.winfo_height()
+        x = px + max(0, (pw - width) // 2)
+        y = py + max(0, (ph - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    # -- UI ------------------------------------------------------------
+
+    def _build_ui(self):
+        left = tk.Frame(self, bg="#12121c", padx=14, pady=12, width=340)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        left.pack_propagate(False)
+
+        tk.Label(left, text="MUNITION", bg="#12121c", fg="#55ff55", font=("Consolas", 9, "bold"), anchor="w").pack(fill=tk.X, pady=(0, 4))
+        preset_cb = tk.OptionMenu(left, self._preset_var, *self._PRESETS.keys(), command=self._apply_preset)
+        preset_cb.config(
+            bg="#2a2a40", fg="#e0e0f0", relief=tk.FLAT, font=("Consolas", 9), activebackground="#50508a", activeforeground="#ffffff", highlightthickness=0, anchor="w"
+        )
+        preset_cb["menu"].config(bg="#2a2a40", fg="#e0e0f0", font=("Consolas", 9))
+        preset_cb.pack(fill=tk.X, pady=(0, 8))
+
+        def section(text):
+            tk.Label(left, text=text, bg="#12121c", fg="#55ff55", font=("Consolas", 9, "bold"), anchor="w").pack(fill=tk.X, pady=(10, 4))
+
+        def field(key, label):
+            row = tk.Frame(left, bg="#12121c")
+            row.pack(fill=tk.X, pady=3)
+            entry = tk.Entry(row, bg="#1e1e30", fg="#e0e0f0", insertbackground="#e0e0f0", relief=tk.FLAT, font=("Consolas", 9), justify="right", width=8)
+            entry.insert(0, self._DEFAULTS[key])
+            entry.pack(side=tk.RIGHT)
+            tk.Label(row, text=label, bg="#12121c", fg="#ffffff", font=("Consolas", 9), anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+            entry.bind("<Return>", lambda _e: self._calculate())
+            self._entries[key] = entry
+
+        field("mass_grains", "Masse (grains)")
+        field("bc", "Coef. balistique G1")
+        field("velocity_m_s", "Vitesse initiale (m/s)")
+        section("VISÉE")
+        field("sight_height_mm", "Hauteur de visée (mm)")
+        field("zero_m", "Distance de réglage (m)")
+        section("TABLEAU")
+        field("max_m", "Distance maximale (m)")
+        field("step_m", "Pas (m)")
+        section("ATMOSPHÈRE")
+        field("temperature_c", "Température (°C)")
+        field("pressure_hpa", "Pression (hPa)")
+        field("wind_m_s", "Vent de travers (m/s)")
+
+        tk.Button(
+            left,
+            text="Calculer",
+            command=self._calculate,
+            bg="#3a6fd8",
+            fg="#ffffff",
+            relief=tk.FLAT,
+            font=("Consolas", 9, "bold"),
+            padx=10,
+            pady=6,
+            cursor="hand2",
+            activebackground="#50508a",
+            activeforeground="#ffffff",
+        ).pack(fill=tk.X, pady=(14, 0))
+
+        tk.Label(
+            left,
+            text=(
+                "Vent : positif = de gauche à droite\n(dérive positive = à droite).\n"
+                "Le coefficient G1 est celui du fabricant (lb/in²).\n"
+                "Les munitions proposées sont indicatives."
+            ),
+            bg="#12121c",
+            fg="#666680",
+            font=("Consolas", 8),
+            justify="left",
+            anchor="w",
+            wraplength=300,
+        ).pack(fill=tk.X, pady=(12, 0))
+
+        right = tk.Frame(self, bg="#0f0f14", padx=8, pady=8)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._summary_var = tk.StringVar(value="")
+        self._summary_lbl = tk.Label(right, textvariable=self._summary_var, bg="#0f0f14", fg="#ffffff", font=("Consolas", 9), justify="left", anchor="w")
+        self._summary_lbl.pack(fill=tk.X, pady=(0, 6))
+
+        table_frame = tk.Frame(right, bg="#0f0f14")
+        table_frame.pack(fill=tk.X)
+        cols = ("dist", "drop", "vel", "energy", "time", "drift")
+        self._tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=11)
+        for col, label, width in [
+            ("dist", "Dist. (m)", 80),
+            ("drop", "Chute / ligne de visée (mm)", 190),
+            ("vel", "Vitesse (m/s)", 100),
+            ("energy", "Énergie (J)", 100),
+            ("time", "Temps (ms)", 90),
+            ("drift", "Dérive (mm)", 100),
+        ]:
+            self._tree.heading(col, text=label)
+            self._tree.column(col, width=width, anchor="center")
+        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=scroll.set)
+        self._tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        scroll.pack(side=tk.LEFT, fill=tk.Y)
+
+        self._canvas = tk.Canvas(right, bg="#0a0a10", highlightthickness=0)
+        self._canvas.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self._canvas.bind("<Configure>", lambda _e: self._draw_plot())
+
+        tk.Label(
+            right,
+            text="Modèle : point matériel, traînée G1, air sec, ligne de visée horizontale. Dérive de rotation non modélisée. Valeurs indicatives.",
+            bg="#0f0f14",
+            fg="#666680",
+            font=("Consolas", 8),
+            anchor="w",
+        ).pack(fill=tk.X, pady=(4, 0))
+
+    # -- Logic -----------------------------------------------------------
+
+    def _apply_preset(self, name: str):
+        for key, value in self._PRESETS[name].items():
+            entry = self._entries[key]
+            entry.delete(0, tk.END)
+            entry.insert(0, value)
+        self._calculate()
+
+    def _value(self, key: str) -> float:
+        return float(self._entries[key].get().replace(",", "."))
+
+    def _calculate(self):
+        for item in self._tree.get_children():
+            self._tree.delete(item)
+        try:
+            res = compute_trajectory_table(
+                mass_grains=self._value("mass_grains"),
+                bc_g1=self._value("bc"),
+                muzzle_velocity_m_s=self._value("velocity_m_s"),
+                sight_height_mm=self._value("sight_height_mm"),
+                zero_distance_m=self._value("zero_m"),
+                max_distance_m=self._value("max_m"),
+                step_m=self._value("step_m"),
+                temperature_c=self._value("temperature_c"),
+                pressure_hpa=self._value("pressure_hpa"),
+                crosswind_m_s=self._value("wind_m_s"),
+            )
+        except ValueError as exc:
+            self._result = None
+            self._summary_var.set(f"Entrée invalide : {exc}")
+            self._summary_lbl.configure(fg="#ff5555")
+            self._draw_plot()
+            return
+
+        self._result = res
+        near = f"{res['near_zero_m']:.1f} m" if res["near_zero_m"] is not None else "—"
+        self._summary_var.set(
+            f"Angle de tir : {res['angle_mrad']:.2f} mrad ({res['angle_deg']:.3f}°)   |   "
+            f"Zéro proche : {near}   |   Zéro lointain : {res['zero_m']:g} m\n"
+            f"Flèche maximale : {res['max_rise_mm']:+.1f} mm au-dessus de la ligne de visée   |   "
+            f"Énergie initiale : {res['muzzle_energy_j']:.0f} J\n"
+            f"Masse volumique de l'air : {res['air_density']:.3f} kg/m³   |   Vitesse du son : {res['speed_of_sound']:.0f} m/s"
+        )
+        self._summary_lbl.configure(fg="#ffffff")
+        for r in res["rows"]:
+            self._tree.insert(
+                "",
+                "end",
+                values=(
+                    f"{r['distance_m']:g}",
+                    f"{r['drop_mm']:+.1f}",
+                    f"{r['velocity_m_s']:.0f}",
+                    f"{r['energy_j']:.0f}",
+                    f"{r['time_ms']:.0f}",
+                    f"{r['drift_mm']:+.1f}",
+                ),
+            )
+        self._draw_plot()
+
+    def _draw_plot(self):
+        """Drop relative to the line of sight versus distance."""
+        c = self._canvas
+        c.delete("all")
+        res = self._result
+        if res is None:
+            return
+
+        xs, ys = res["plot_x_m"], res["plot_drop_mm"]
+        w = max(c.winfo_width(), 200)
+        h = max(c.winfo_height(), 150)
+        ml, mr, mt, mb = 60, 25, 32, 40
+        x_max = float(xs[-1])
+        y_min = min(float(np.min(ys)), 0.0)
+        y_max = max(float(np.max(ys)), 0.0)
+        if y_max - y_min < 1.0:
+            y_min -= 0.5
+            y_max += 0.5
+        pad = (y_max - y_min) * 0.1
+        y_min -= pad
+        y_max += pad
+
+        def X(v):
+            return ml + (w - ml - mr) * v / x_max
+
+        def Y(v):
+            return mt + (h - mt - mb) * (1.0 - (v - y_min) / (y_max - y_min))
+
+        # Horizontal grid + y labels
+        for g in range(6):
+            gv = y_min + (y_max - y_min) * g / 5
+            c.create_line(ml, Y(gv), w - mr, Y(gv), fill="#222235")
+            c.create_text(ml - 8, Y(gv), anchor="e", fill="#888899", font=("Consolas", 8), text=f"{gv:.0f}")
+
+        # x labels at table distances (thinned when there are many)
+        dists = [r["distance_m"] for r in res["rows"]]
+        skip = max(1, len(dists) // 10)
+        for i, d in enumerate(dists):
+            if i % skip == 0:
+                c.create_line(X(d), h - mb, X(d), h - mb + 4, fill="#444466")
+                c.create_text(X(d), h - mb + 14, fill="#888899", font=("Consolas", 8), text=f"{d:g}")
+        c.create_text((ml + w - mr) / 2, h - 8, fill="#888899", font=("Consolas", 8), text="Distance (m)")
+
+        c.create_line(ml, mt, ml, h - mb, fill="#444466")
+        c.create_line(ml, h - mb, w - mr, h - mb, fill="#444466")
+
+        # Line of sight (drop = 0)
+        c.create_line(ml, Y(0.0), w - mr, Y(0.0), fill="#888899", dash=(5, 4))
+        c.create_text(w - mr - 4, Y(0.0) - 8, anchor="e", fill="#888899", font=("Consolas", 8), text="ligne de visée")
+
+        # Trajectory
+        pts = []
+        for x, y in zip(xs, ys):
+            pts.extend([X(float(x)), Y(float(y))])
+        c.create_line(*pts, fill="#00cfff", width=2)
+
+        # Zero point marker
+        if res["zero_m"] <= x_max:
+            zx, zy = X(res["zero_m"]), Y(0.0)
+            c.create_oval(zx - 5, zy - 5, zx + 5, zy + 5, outline="#ffff00", width=2)
+
+        c.create_text(ml, 10, anchor="nw", fill="#ffffff", font=("Consolas", 10, "bold"), text="Trajectoire — chute par rapport à la ligne de visée (mm)")
 
 
 class HistoryWindow(tk.Toplevel):
@@ -1688,6 +2540,7 @@ class TargetApp(tk.Tk):
         g_history = group("#2a2410")
         btn(g_history, "Historique", self._open_history, bg="#8a6a2a")
         btn(g_history, "Stabilité balle", self._open_stability, bg="#5a3a8a")
+        btn(g_history, "Balistique", self._open_ballistics, bg="#5a3a8a")
 
     def _build_left_panel(self, parent: tk.Frame):
         self._path_lbl = tk.Label(parent, text="Aucune image chargée", bg="#12121c", fg="#ffffff", font=("Consolas", 8), anchor="w", wraplength=235)
@@ -1991,6 +2844,10 @@ class TargetApp(tk.Tk):
     def _open_stability(self):
         """Open the gyroscopic stability (SG, Miller formula) calculator."""
         StabilityWindow(self)
+
+    def _open_ballistics(self):
+        """Open the exterior ballistics (trajectory) calculator."""
+        BallisticsWindow(self)
 
     # ------------------------------------------------------------------
     # Canvas / viewport helpers
@@ -3026,7 +3883,7 @@ class TargetApp(tk.Tk):
         c = self._canvas
         w = c.winfo_width()
         h = c.winfo_height()
-        box = 9  # half-size of the pick box (px); the hairlines stop at its edge
+        box = 7  # half-size of the pick box (px); the hairlines stop at its edge
         color = "#00e5ff"  # hairlines + pick box
         halo = "#000000"  # dark underlay so the hairlines stay visible on any background
         tags = ("calib_cursor",)
