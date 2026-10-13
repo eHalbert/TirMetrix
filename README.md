@@ -1,4 +1,4 @@
-![Fenêtre principale de TirMetrix](docs/TirMetrix.png)
+!docs/TirMetrix.png
 
 # TirMetrix
 
